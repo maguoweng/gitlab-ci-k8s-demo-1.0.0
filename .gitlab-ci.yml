@@ -1,0 +1,133 @@
+image: golang:1.10.2-stretch
+
+# The problem is that to be able to use go get, one needs to put
+# the repository in the $GOPATH. So for example if your gitlab domain
+# is mydomainperso.com, and that your repository is repos/projectname, and
+# the default GOPATH being /go, then you'd need to have your
+# repository in /go/src/mydomainperso.com/repos/projectname
+# Thus, making a symbolic link corrects this.
+before_script:
+  - mkdir -p "/go/src/gitlab.zerbytes.net/${CI_PROJECT_NAMESPACE}"
+  - ln -sf "${CI_PROJECT_DIR}" "/go/src/gitlab.zerbytes.net/${CI_PROJECT_PATH}"
+  - cd "/go/src/gitlab.zerbytes.net/${CI_PROJECT_PATH}/"
+
+stages:
+  - test
+  - build
+  - release
+  - review
+  - deploy
+
+test:
+  stage: test
+  script:
+    - make test
+
+test2:
+  stage: test
+  script:
+    - sleep 3
+    - echo "We did it! Something else runs in parallel!"
+
+compile:
+  stage: build
+  script:
+    # Add here all the dependencies, or use glide/govendor/...
+    # to get them automatically.
+    - make build
+  artifacts:
+    paths:
+      - app
+
+# Example job to upload the built release to a S3 server with mc
+#release_upload:
+#  stage: release
+#  image: minio/mc
+#  script:
+#    - echo "=> We already have artifact sotrage in GitLab! This is for demonstational purposes only."
+#    - mc config host add edenmalmoe https://s3.edenmal.net ${ACCESS_KEY} ${SECRET_KEY} S3v4
+#    - mc mb -p edenmalmoe/build-release-${CI_PROJECT_NAME}/
+#    - mc cp app edenmalmoe/build-release-${CI_PROJECT_NAME}/
+
+
+image_build:
+  stage: release
+  image: docker:latest
+  variables:
+    DOCKER_HOST: tcp://localhost:2375
+  services:
+    - docker:dind
+  script:
+    - docker info
+    - docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} registry.zerbytes.net
+    - docker build -t registry.zerbytes.net/${CI_PROJECT_PATH}:latest .
+    - docker tag registry.zerbytes.net/${CI_PROJECT_PATH}:latest registry.zerbytes.net/${CI_PROJECT_PATH}:${CI_COMMIT_REF_NAME}
+    - test ! -z "${CI_COMMIT_TAG}" && docker push registry.zerbytes.net/${CI_PROJECT_PATH}:latest
+    - docker push registry.zerbytes.net/${CI_PROJECT_PATH}:${CI_COMMIT_REF_NAME}
+
+deploy_review:
+  image: lachlanevenson/k8s-kubectl:latest
+  stage: review
+  only:
+    - branches
+  except:
+    - tags
+  environment:
+    name: review/$CI_BUILD_REF_NAME
+    url: https://$CI_BUILD_REF_SLUG-presentation-gitlab-k8s.edenmal.net
+    on_stop: stop_review
+  script:
+    - kubectl version
+    - cd manifests/
+    - sed -i "s/__CI_BUILD_REF_SLUG__/${CI_BUILD_REF_SLUG}/" deployment.yaml ingress.yaml service.yaml
+    - sed -i "s/__VERSION__/${CI_COMMIT_REF_NAME}/" deployment.yaml ingress.yaml service.yaml
+    - |
+      if kubectl apply -f deployment.yaml | grep -q unchanged; then
+          echo "=> Patching deployment to force image update."
+          kubectl patch -f deployment.yaml -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"ci-last-updated\":\"$(date +'%s')\"}}}}}"
+      else
+          echo "=> Deployment apply has changed the object, no need to force image update."
+      fi
+    - kubectl apply -f service.yaml || true
+    - kubectl apply -f ingress.yaml
+    - kubectl rollout status -f deployment.yaml
+    - kubectl get all,ing -l app=${CI_BUILD_REF_SLUG}
+
+stop_review:
+  image: lachlanevenson/k8s-kubectl:latest
+  stage: review
+  variables:
+    GIT_STRATEGY: none
+  when: manual
+  only:
+    - branches
+  except:
+    - master
+    - tags
+  environment:
+    name: review/$CI_BUILD_REF_NAME
+    action: stop
+  script:
+    - kubectl version
+    - kubectl delete ing -l app=${CI_BUILD_REF_SLUG}
+    - kubectl delete all -l app=${CI_BUILD_REF_SLUG}
+
+deploy_live:
+  image: lachlanevenson/k8s-kubectl:latest
+  stage: deploy
+  environment:
+    name: live
+    url: https://live-presentation-gitlab-k8s.edenmal.net
+  only:
+    - tags
+  when: manual
+  script:
+    - kubectl version
+    - cd manifests/
+    - sed -i "s/__CI_BUILD_REF_SLUG__/${CI_ENVIRONMENT_SLUG}/" deployment.yaml ingress.yaml service.yaml
+    - sed -i "s/__VERSION__/${CI_COMMIT_REF_NAME}/" deployment.yaml ingress.yaml service.yaml
+    - kubectl apply -f deployment.yaml
+    - kubectl apply -f service.yaml
+    - kubectl apply -f ingress.yaml
+    - kubectl rollout status -f deployment.yaml
+    - kubectl get all,ing -l app=${CI_ENVIRONMENT_SLUG}
